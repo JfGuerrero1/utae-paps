@@ -92,6 +92,7 @@ def main(config):
             reference_date=config.ref_date,
             mono_date=config.mono_date,
             target="instance",
+            sats=['S2']
         )
 
         dt_test = PASTIS_Dataset(**dt_args, folds=test_fold)
