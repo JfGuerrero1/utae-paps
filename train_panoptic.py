@@ -383,6 +383,7 @@ def main(config):
             reference_date=config.ref_date,
             mono_date=config.mono_date,
             target="instance",
+            sats=['S2']
         )
         dt_train = PASTIS_Dataset(**dt_args, cache=config.cache, folds=train_folds)
         dt_val = PASTIS_Dataset(**dt_args, folds=val_fold)
