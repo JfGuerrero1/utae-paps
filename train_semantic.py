@@ -1,39 +1,38 @@
 """
-Main script for semantic experiments
+Main script for semantic experiments - PyTorch Lightning version (Optimized)
 Author: Vivien Sainte Fare Garnot (github/VSainteuf)
-License: MIT
+Modified for: Class 0 & 19 ignoring & Lightning best practices
 """
 import argparse
 import json
 import os
 import pickle as pkl
 import pprint
-import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data as data
-import torchnet as tnt
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
-from src.learning.metrics import confusion_matrix_analysis
 from src.learning.miou import IoU
 from src.learning.weight_init import weight_init
 
+# Classes ignorées dans la loss ET les métriques
+IGNORE_CLASSES = [0, 19]  # 0=Background, 19=Void label
+
+# ---------------------------------------------------------------------------
+# Argument Parser
+# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-# Model parameters
-parser.add_argument(
-    "--model",
-    default="utae",
-    type=str,
-    help="Type of architecture to use. Can be one of: (utae/unet3d/fpn/convlstm/convgru/uconvlstm/buconvlstm)",
-)
-## U-TAE Hyperparameters
+parser.add_argument("--model", default="utae", type=str)
 parser.add_argument("--encoder_widths", default="[64,64,64,128]", type=str)
 parser.add_argument("--decoder_widths", default="[32,32,64,128]", type=str)
-parser.add_argument("--out_conv", default="[32, 20]")
+parser.add_argument("--out_conv", default="[32, 20]", type=str)
 parser.add_argument("--str_conv_k", default=4, type=int)
 parser.add_argument("--str_conv_s", default=2, type=int)
 parser.add_argument("--str_conv_p", default=1, type=int)
@@ -43,369 +42,203 @@ parser.add_argument("--n_head", default=16, type=int)
 parser.add_argument("--d_model", default=256, type=int)
 parser.add_argument("--d_k", default=4, type=int)
 
-# Set-up parameters
-parser.add_argument(
-    "--dataset_folder",
-    default="",
-    type=str,
-    help="Path to the folder where the results are saved.",
-)
-parser.add_argument(
-    "--res_dir",
-    default="./results",
-    help="Path to the folder where the results should be stored",
-)
-parser.add_argument(
-    "--num_workers", default=8, type=int, help="Number of data loading workers"
-)
-parser.add_argument("--rdm_seed", default=1, type=int, help="Random seed")
-parser.add_argument(
-    "--device",
-    default="cuda",
-    type=str,
-    help="Name of device to use for tensor computations (cuda/cpu)",
-)
-parser.add_argument(
-    "--display_step",
-    default=50,
-    type=int,
-    help="Interval in batches between display of training metrics",
-)
-parser.add_argument(
-    "--cache",
-    dest="cache",
-    action="store_true",
-    help="If specified, the whole dataset is kept in RAM",
-)
-# Training parameters
-parser.add_argument("--epochs", default=100, type=int, help="Number of epochs per fold")
-parser.add_argument("--batch_size", default=4, type=int, help="Batch size")
-parser.add_argument("--lr", default=0.001, type=float, help="Learning rate")
-parser.add_argument("--mono_date", default=None, type=str)
-parser.add_argument("--ref_date", default="2018-09-01", type=str)
-parser.add_argument(
-    "--fold",
-    default=None,
-    type=int,
-    help="Do only one of the five fold (between 1 and 5)",
-)
-parser.add_argument("--num_classes", default=20, type=int)
-parser.add_argument("--ignore_index", default=-1, type=int)
-parser.add_argument("--pad_value", default=0, type=float)
-parser.add_argument("--padding_mode", default="reflect", type=str)
-parser.add_argument(
-    "--val_every",
-    default=1,
-    type=int,
-    help="Interval in epochs between two validation steps.",
-)
-parser.add_argument(
-    "--val_after",
-    default=0,
-    type=int,
-    help="Do validation only after that many epochs.",
-)
-
-list_args = ["encoder_widths", "decoder_widths", "out_conv"]
+parser.add_argument("--dataset_folder", default="", type=str)
+parser.add_argument("--res_dir", default="./results", help="Path for results")
+parser.add_argument("--num_workers", default=8, type=int)
+parser.add_argument("--rdm_seed", default=1, type=int)
+parser.add_argument("--device", default="cuda", type=str)
+parser.add_argument("--display_step", default=50, type=int)
+parser.add_argument("--cache", dest="cache", action="store_true")
 parser.set_defaults(cache=False)
 
+parser.add_argument("--epochs", default=100, type=int)
+parser.add_argument("--batch_size", default=4, type=int)
+parser.add_argument("--lr", default=0.001, type=float)
+parser.add_argument("--mono_date", default=None, type=str)
+parser.add_argument("--ref_date", default="2018-09-01", type=str)
+parser.add_argument("--num_classes", default=20, type=int)
+parser.add_argument("--pad_value", default=0, type=float)
+parser.add_argument("--padding_mode", default="reflect", type=str)
+parser.add_argument("--val_every", default=1, type=int)
 
-def iterate(
-    model, data_loader, criterion, config, optimizer=None, mode="train", device=None
-):
-    loss_meter = tnt.meter.AverageValueMeter()
-    iou_meter = IoU(
-        num_classes=config.num_classes,
-        ignore_index=config.ignore_index,
-        cm_device=config.device,
-    )
+# ---------------------------------------------------------------------------
+# Lightning Module
+# ---------------------------------------------------------------------------
 
-    t_start = time.time()
-    for i, batch in enumerate(data_loader):
-        if device is not None:
-            batch = recursive_todevice(batch, device)
+class SemanticSegmentationModule(L.LightningModule):
+    def __init__(self, model, config):
+        super().__init__()
+        self.model = model
+        self.config = config
+
+        # --- Loss : poids nuls sur Background (0) et Void (19) ---
+        # On utilise weight= pour les deux classes plutôt que ignore_index
+        # car ignore_index n'accepte qu'un seul entier dans PyTorch.
+        weights = torch.ones(config.num_classes).float()
+        for cls in IGNORE_CLASSES:
+            weights[cls] = 0.0
+        self.register_buffer("loss_weights", weights)
+        self.criterion = nn.CrossEntropyLoss(weight=self.loss_weights)
+
+        # --- Métriques : ignore les mêmes classes ---
+        self.train_iou = IoU(num_classes=config.num_classes, ignore_index=IGNORE_CLASSES, cm_device=config.device)
+        self.val_iou   = IoU(num_classes=config.num_classes, ignore_index=IGNORE_CLASSES, cm_device=config.device)
+        self.test_iou  = IoU(num_classes=config.num_classes, ignore_index=IGNORE_CLASSES, cm_device=config.device)
+
+        self.test_conf_mat = None
+
+    def forward(self, x, dates):
+        return self.model(x, batch_positions=dates)
+
+    def _shared_step(self, batch):
         (x, dates), y = batch
         y = y.long()
+        out = self(x, dates)
+        loss = self.criterion(out, y)
+        pred = out.argmax(dim=1)
+        return loss, pred, y
 
-        if mode != "train":
-            with torch.no_grad():
-                out = model(x, batch_positions=dates)
-        else:
-            optimizer.zero_grad()
-            out = model(x, batch_positions=dates)
+    def training_step(self, batch, batch_idx):
+        loss, pred, y = self._shared_step(batch)
+        self.train_iou.add(pred, y)
+        self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
 
-        loss = criterion(out, y)
-        if mode == "train":
-            loss.backward()
-            optimizer.step()
+    def on_train_epoch_end(self):
+        miou, acc = self.train_iou.get_miou_acc()
+        self.log("train/miou", miou)
+        self.log("train/acc", acc)
+        self.train_iou.reset()
 
-        with torch.no_grad():
-            pred = out.argmax(dim=1)
-        iou_meter.add(pred, y)
-        loss_meter.add(loss.item())
+    def validation_step(self, batch, batch_idx):
+        loss, pred, y = self._shared_step(batch)
+        self.val_iou.add(pred, y)
+        self.log("val/loss", loss, prog_bar=True)
 
-        if (i + 1) % config.display_step == 0:
-            miou, acc = iou_meter.get_miou_acc()
-            print(
-                "Step [{}/{}], Loss: {:.4f}, Acc : {:.2f}, mIoU {:.2f}".format(
-                    i + 1, len(data_loader), loss_meter.value()[0], acc, miou
-                )
-            )
+    def on_validation_epoch_end(self):
+        miou, acc = self.val_iou.get_miou_acc()
+        self.log("val/miou", miou, prog_bar=True)
+        self.log("val/acc", acc)
+        print(f"\n[Epoch {self.current_epoch}] Val mIoU: {miou:.4f} | Acc: {acc:.2f}")
+        self.val_iou.reset()
 
-    t_end = time.time()
-    total_time = t_end - t_start
-    print("Epoch time : {:.1f}s".format(total_time))
-    miou, acc = iou_meter.get_miou_acc()
-    metrics = {
-        "{}_accuracy".format(mode): acc,
-        "{}_loss".format(mode): loss_meter.value()[0],
-        "{}_IoU".format(mode): miou,
-        "{}_epoch_time".format(mode): total_time,
-    }
+    def test_step(self, batch, batch_idx):
+        loss, pred, y = self._shared_step(batch)
+        self.test_iou.add(pred, y)
+        self.log("test/loss", loss)
 
-    if mode == "test":
-        return metrics, iou_meter.conf_metric.value()  # confusion matrix
-    else:
-        return metrics
+    def on_test_epoch_end(self):
+        miou, acc = self.test_iou.get_miou_acc()
+        self.log("test/miou", miou)
+        self.log("test/acc", acc)
+        self.test_conf_mat = self.test_iou.conf_metric.value()
+        print(f"\n[TEST FINAL] mIoU: {miou:.4f} | Acc: {acc:.2f}")
 
-
-def recursive_todevice(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    elif isinstance(x, dict):
-        return {k: recursive_todevice(v, device) for k, v in x.items()}
-    else:
-        return [recursive_todevice(c, device) for c in x]
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.config.lr)
 
 
-def prepare_output(config):
-    os.makedirs(config.res_dir, exist_ok=True)
-    for fold in range(1, 6):
-        os.makedirs(os.path.join(config.res_dir, "Fold_{}".format(fold)), exist_ok=True)
-
-
-def checkpoint(fold, log, config):
-    with open(
-        os.path.join(config.res_dir, "Fold_{}".format(fold), "trainlog.json"), "w"
-    ) as outfile:
-        json.dump(log, outfile, indent=4)
-
-
-def save_results(fold, metrics, conf_mat, config):
-    with open(
-        os.path.join(config.res_dir, "Fold_{}".format(fold), "test_metrics.json"), "w"
-    ) as outfile:
-        json.dump(metrics, outfile, indent=4)
-    pkl.dump(
-        conf_mat,
-        open(
-            os.path.join(config.res_dir, "Fold_{}".format(fold), "conf_mat.pkl"), "wb"
-        ),
-    )
-
-
-def overall_performance(config):
-    cm = np.zeros((config.num_classes, config.num_classes))
-    for fold in range(1, 6):
-        cm += pkl.load(
-            open(
-                os.path.join(config.res_dir, "Fold_{}".format(fold), "conf_mat.pkl"),
-                "rb",
-            )
-        )
-
-    if config.ignore_index is not None:
-        cm = np.delete(cm, config.ignore_index, axis=0)
-        cm = np.delete(cm, config.ignore_index, axis=1)
-
-    _, perf = confusion_matrix_analysis(cm)
-
-    print("Overall performance:")
-    print("Acc: {},  IoU: {}".format(perf["Accuracy"], perf["MACRO_IoU"]))
-
-    with open(os.path.join(config.res_dir, "overall.json"), "w") as file:
-        file.write(json.dumps(perf, indent=4))
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main(config):
-    fold_sequence = [
-        [[1, 2, 3], [4], [5]],
-        [[2, 3, 4], [5], [1]],
-        [[3, 4, 5], [1], [2]],
-        [[4, 5, 1], [2], [3]],
-        [[5, 1, 2], [3], [4]],
-    ]
+    L.seed_everything(config.rdm_seed)
+    os.makedirs(config.res_dir, exist_ok=True)
 
-    np.random.seed(config.rdm_seed)
-    torch.manual_seed(config.rdm_seed)
-    prepare_output(config)
-    device = torch.device(config.device)
-
-    fold_sequence = (
-        fold_sequence if config.fold is None else [fold_sequence[config.fold - 1]]
+    dt_args = dict(
+        folder=config.dataset_folder, norm=True, reference_date=config.ref_date,
+        mono_date=config.mono_date, target="semantic", sats=["S2"],
     )
-    for fold, (train_folds, val_fold, test_fold) in enumerate(fold_sequence):
-        if config.fold is not None:
-            fold = config.fold - 1
 
-        # Dataset definition
-        dt_args = dict(
-            folder=config.dataset_folder,
-            norm=True,
-            reference_date=config.ref_date,
-            mono_date=config.mono_date,
-            target="semantic",
-            sats=["S2"],
-        )
+    # Split fixe : train=1,2,3 | val=5 | test=4
+    dt_train = PASTIS_Dataset(**dt_args, folds=[1, 2, 3], cache=config.cache)
+    dt_val   = PASTIS_Dataset(**dt_args, folds=[5],       cache=config.cache)
+    dt_test  = PASTIS_Dataset(**dt_args, folds=[4])
 
-        dt_train = PASTIS_Dataset(**dt_args, folds=train_folds, cache=config.cache)
-        dt_val = PASTIS_Dataset(**dt_args, folds=val_fold, cache=config.cache)
-        dt_test = PASTIS_Dataset(**dt_args, folds=test_fold)
+    print("Train {}, Val {}, Test {}".format(len(dt_train), len(dt_val), len(dt_test)))
 
-        collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
-        train_loader = data.DataLoader(
-            dt_train,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
-        val_loader = data.DataLoader(
-            dt_val,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
-        test_loader = data.DataLoader(
-            dt_test,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
+    collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
 
-        print(
-            "Train {}, Val {}, Test {}".format(len(dt_train), len(dt_val), len(dt_test))
-        )
+    train_loader = data.DataLoader(
+        dt_train, batch_size=config.batch_size, shuffle=True,
+        drop_last=True, num_workers=config.num_workers, collate_fn=collate_fn,
+    )
+    val_loader = data.DataLoader(
+        dt_val, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, collate_fn=collate_fn,
+    )
+    test_loader = data.DataLoader(
+        dt_test, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, collate_fn=collate_fn,
+    )
 
-        # Model definition
-        model = model_utils.get_model(config, mode="semantic")
-        config.N_params = utils.get_ntrainparams(model)
-        with open(os.path.join(config.res_dir, "conf.json"), "w") as file:
-            file.write(json.dumps(vars(config), indent=4))
-        print(model)
-        print("TOTAL TRAINABLE PARAMETERS :", config.N_params)
-        print("Trainable layers:")
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                print(name)
-        model = model.to(device)
-        model.apply(weight_init)
+    # Modèle
+    model = model_utils.get_model(config, mode="semantic")
+    model.apply(weight_init)
+    config.N_params = utils.get_ntrainparams(model)
+    print(model)
+    print("TOTAL TRAINABLE PARAMETERS:", config.N_params)
 
-        # Optimizer and Loss
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    with open(os.path.join(config.res_dir, "conf.json"), "w") as f:
+        json.dump(vars(config), f, indent=4)
 
-        weights = torch.ones(config.num_classes, device=device).float()
-        weights[config.ignore_index] = 0
-        criterion = nn.CrossEntropyLoss(weight=weights)
+    lit_model = SemanticSegmentationModule(model, config)
 
-        # Training loop
-        trainlog = {}
-        best_mIoU = 0
-        for epoch in range(1, config.epochs + 1):
-            print("EPOCH {}/{}".format(epoch, config.epochs))
+    # Callbacks & Logger
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=config.res_dir, filename="best_model",
+        monitor="val/miou", mode="max", save_top_k=1,
+    )
+    logger = TensorBoardLogger(save_dir=config.res_dir, name="logs")
 
-            model.train()
-            train_metrics = iterate(
-                model,
-                data_loader=train_loader,
-                criterion=criterion,
-                config=config,
-                optimizer=optimizer,
-                mode="train",
-                device=device,
-            )
-            if epoch % config.val_every == 0 and epoch > config.val_after:
-                print("Validation . . . ")
-                model.eval()
-                val_metrics = iterate(
-                    model,
-                    data_loader=val_loader,
-                    criterion=criterion,
-                    config=config,
-                    optimizer=optimizer,
-                    mode="val",
-                    device=device,
-                )
+    # Trainer
+    accelerator = "cpu" if config.device == "cpu" else "gpu"
+    trainer = L.Trainer(
+        max_epochs=config.epochs,
+        accelerator=accelerator,
+        devices=1,
+        logger=logger,
+        callbacks=[checkpoint_cb],
+        check_val_every_n_epoch=config.val_every,
+        log_every_n_steps=config.display_step,
+        num_sanity_val_steps=0,
+    )
 
-                print(
-                    "Loss {:.4f},  Acc {:.2f},  IoU {:.4f}".format(
-                        val_metrics["val_loss"],
-                        val_metrics["val_accuracy"],
-                        val_metrics["val_IoU"],
-                    )
-                )
+    trainer.fit(lit_model, train_loader, val_loader)
 
-                trainlog[epoch] = {**train_metrics, **val_metrics}
-                checkpoint(fold + 1, trainlog, config)
-                if val_metrics["val_IoU"] >= best_mIoU:
-                    best_mIoU = val_metrics["val_IoU"]
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "state_dict": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                        },
-                        os.path.join(
-                            config.res_dir, "Fold_{}".format(fold + 1), "model.pth.tar"
-                        ),
-                    )
-            else:
-                trainlog[epoch] = {**train_metrics}
-                checkpoint(fold + 1, trainlog, config)
+    # Test sur le meilleur checkpoint
+    print("\nTesting best epoch . . .")
+    trainer.test(lit_model, dataloaders=test_loader, ckpt_path="best")
 
-        print("Testing best epoch . . .")
-        model.load_state_dict(
-            torch.load(
-                os.path.join(
-                    config.res_dir, "Fold_{}".format(fold + 1), "model.pth.tar"
-                )
-            )["state_dict"]
-        )
-        model.eval()
+    # Sauvegarde finale
+    conf_mat = lit_model.test_conf_mat
+    if torch.is_tensor(conf_mat):
+        conf_mat = conf_mat.cpu().numpy()
 
-        test_metrics, conf_mat = iterate(
-            model,
-            data_loader=test_loader,
-            criterion=criterion,
-            config=config,
-            optimizer=optimizer,
-            mode="test",
-            device=device,
-        )
-        print(
-            "Loss {:.4f},  Acc {:.2f},  IoU {:.4f}".format(
-                test_metrics["test_loss"],
-                test_metrics["test_accuracy"],
-                test_metrics["test_IoU"],
-            )
-        )
-        save_results(fold + 1, test_metrics, conf_mat.cpu().numpy(), config)
+    metrics = {
+        "test_miou": float(trainer.callback_metrics.get("test/miou", float("nan"))),
+        "test_acc":  float(trainer.callback_metrics.get("test/acc",  float("nan"))),
+        "test_loss": float(trainer.callback_metrics.get("test/loss", float("nan"))),
+    }
+    print("Loss {:.4f},  Acc {:.2f},  IoU {:.4f}".format(
+        metrics["test_loss"], metrics["test_acc"], metrics["test_miou"]
+    ))
 
-    if config.fold is None:
-        overall_performance(config)
+    with open(os.path.join(config.res_dir, "test_metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=4)
+    pkl.dump(conf_mat, open(os.path.join(config.res_dir, "conf_mat.pkl"), "wb"))
 
 
 if __name__ == "__main__":
     config = parser.parse_args()
-    for k, v in vars(config).items():
-        if k in list_args and v is not None:
-            v = v.replace("[", "")
-            v = v.replace("]", "")
-            config.__setattr__(k, list(map(int, v.split(","))))
+
+    # Parsing sécurisé des listes
+    for arg in ["encoder_widths", "decoder_widths", "out_conv"]:
+        val = getattr(config, arg)
+        if isinstance(val, str):
+            setattr(config, arg, json.loads(val))
 
     assert config.num_classes == config.out_conv[-1]
-
-    pprint.pprint(config)
+    pprint.pprint(vars(config))
     main(config)
